@@ -24,6 +24,20 @@ def make_client(handler: Any) -> tuple[ChatClient, httpx.Client]:
     return ChatClient(make_config(), http_client=http_client), http_client
 
 
+def make_sse_response(*chunks: dict[str, Any]) -> httpx.Response:
+    lines = [
+        f"data: {json.dumps(chunk, ensure_ascii=False)}"
+        for chunk in chunks
+    ]
+    lines.append("data: [DONE]")
+    body = "\n\n".join(lines) + "\n\n"
+    return httpx.Response(
+        200,
+        content=body.encode("utf-8"),
+        headers={"content-type": "text/event-stream; charset=utf-8"},
+    )
+
+
 def test_chat_completion_sends_openai_compatible_request() -> None:
     captured: dict[str, Any] = {}
 
@@ -135,3 +149,75 @@ def test_complete_returns_message_text() -> None:
         answer = client.complete([{"role": "user", "content": "hi"}])
 
     assert answer == "最终回答"
+
+
+def test_stream_chat_completion_yields_sse_chunks() -> None:
+    captured: dict[str, Any] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured["body"] = json.loads(request.content)
+        return make_sse_response(
+            {"choices": [{"delta": {"content": "你"}}]},
+            {"choices": [{"delta": {"content": "好"}}]},
+            {"choices": [{"delta": {}, "finish_reason": "stop"}]},
+        )
+
+    client, http_client = make_client(handler)
+
+    with http_client:
+        chunks = list(
+            client.stream_chat_completion([{"role": "user", "content": "hi"}])
+        )
+
+    assert [
+        chunk["choices"][0]["delta"]["content"]
+        for chunk in chunks
+        if chunk["choices"][0]["delta"].get("content")
+    ] == ["你", "好"]
+    assert captured["body"]["stream"] is True
+
+
+def test_stream_http_error_is_wrapped() -> None:
+    def handler(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            401,
+            json={"error": {"message": "invalid api key"}},
+        )
+
+    client, http_client = make_client(handler)
+
+    with http_client, pytest.raises(APIError) as excinfo:
+        list(
+            client.stream_chat_completion([{"role": "user", "content": "hi"}])
+        )
+
+    assert excinfo.value.status_code == 401
+    assert "invalid api key" in str(excinfo.value)
+
+
+def test_stream_error_chunk_is_raised() -> None:
+    def handler(_request: httpx.Request) -> httpx.Response:
+        return make_sse_response({"error": {"message": "stream failed"}})
+
+    client, http_client = make_client(handler)
+
+    with http_client, pytest.raises(APIError, match="stream failed"):
+        list(
+            client.stream_chat_completion([{"role": "user", "content": "hi"}])
+        )
+
+
+def test_stream_with_json_content_type_is_rejected() -> None:
+    def handler(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={"error": {"message": "stream unsupported"}},
+            headers={"content-type": "application/json"},
+        )
+
+    client, http_client = make_client(handler)
+
+    with http_client, pytest.raises(APIError, match="未返回 SSE"):
+        list(
+            client.stream_chat_completion([{"role": "user", "content": "hi"}])
+        )

@@ -3,7 +3,8 @@
 from __future__ import annotations
 
 import json
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Generator, Mapping
+from contextlib import closing
 from typing import Any, Protocol
 
 from .history import ConversationHistory
@@ -23,6 +24,15 @@ class ChatCompletionClient(Protocol):
     ) -> dict[str, Any]:
         ...
 
+    def stream_chat_completion(
+        self,
+        messages: list[dict[str, Any]],
+        *,
+        tools: list[dict[str, Any]] | None = None,
+        tool_choice: str | dict[str, Any] | None = None,
+    ) -> Generator[dict[str, Any], None, None]:
+        ...
+
 
 class ToolExecutor(Protocol):
     def schemas(self) -> list[dict[str, Any]]:
@@ -34,6 +44,7 @@ class ToolExecutor(Protocol):
 
 ToolCallCallback = Callable[[str, Mapping[str, Any]], None]
 ToolResultCallback = Callable[[str, str], None]
+TokenCallback = Callable[[str], None]
 
 
 class Agent:
@@ -61,7 +72,12 @@ class Agent:
         self.on_tool_call = on_tool_call
         self.on_tool_result = on_tool_result
 
-    def send(self, user_input: str) -> str:
+    def send(
+        self,
+        user_input: str,
+        *,
+        on_token: TokenCallback | None = None,
+    ) -> str:
         text = user_input.strip()
         if not text:
             raise ValueError("用户输入不能为空")
@@ -72,7 +88,7 @@ class Agent:
         # 首次请求成功后才提交 user 消息，避免用户重试时产生重复上下文。
         messages = self.history.messages()
         messages.append({"role": "user", "content": text})
-        message = self._request(messages, tools, tool_choice)
+        message = self._request(messages, tools, tool_choice, on_token)
         self.history.add_user(text)
         self.history.add_assistant(message)
 
@@ -84,7 +100,9 @@ class Agent:
                 )
             rounds += 1
             self._execute_tool_calls(message)
-            message = self._request(self.history.messages(), tools, tool_choice)
+            message = self._request(
+                self.history.messages(), tools, tool_choice, on_token
+            )
             self.history.add_assistant(message)
 
         content = message.get("content")
@@ -95,7 +113,13 @@ class Agent:
         messages: list[dict[str, Any]],
         tools: list[dict[str, Any]] | None,
         tool_choice: str | None,
+        on_token: TokenCallback | None = None,
     ) -> dict[str, Any]:
+        if on_token is not None:
+            return self._stream_request(
+                messages, tools, tool_choice, on_token
+            )
+
         if tools:
             data = self.client.chat_completion(
                 messages,
@@ -105,6 +129,59 @@ class Agent:
         else:
             data = self.client.chat_completion(messages)
         return _extract_message(data)
+
+    def _stream_request(
+        self,
+        messages: list[dict[str, Any]],
+        tools: list[dict[str, Any]] | None,
+        tool_choice: str | None,
+        on_token: TokenCallback,
+    ) -> dict[str, Any]:
+        if tools:
+            chunks = self.client.stream_chat_completion(
+                messages,
+                tools=tools,
+                tool_choice=tool_choice,
+            )
+        else:
+            chunks = self.client.stream_chat_completion(messages)
+
+        content_parts: list[str] = []
+        tool_calls: dict[int, dict[str, Any]] = {}
+
+        with closing(chunks) as stream:
+            for chunk in stream:
+                choices = chunk.get("choices")
+                if not isinstance(choices, list) or not choices:
+                    continue
+
+                first = choices[0]
+                if not isinstance(first, dict):
+                    continue
+
+                delta = first.get("delta")
+                if not isinstance(delta, dict):
+                    continue
+
+                content = delta.get("content")
+                if isinstance(content, str) and content:
+                    content_parts.append(content)
+                    on_token(content)
+
+                _merge_tool_call_deltas(
+                    tool_calls, delta.get("tool_calls")
+                )
+
+        message: dict[str, Any] = {
+            "role": "assistant",
+            "content": "".join(content_parts) or None,
+        }
+        if tool_calls:
+            message["tool_calls"] = [
+                _finalize_tool_call(index, tool_calls[index])
+                for index in sorted(tool_calls)
+            ]
+        return message
 
     def _execute_tool_calls(self, message: Mapping[str, Any]) -> None:
         tool_calls = message.get("tool_calls")
@@ -208,6 +285,8 @@ def _parse_arguments(
 ) -> tuple[dict[str, Any], None] | tuple[None, str]:
     if raw is None:
         raw = "{}"
+    if isinstance(raw, str) and not raw.strip():
+        raw = "{}"
 
     if isinstance(raw, Mapping):
         return dict(raw), None
@@ -222,3 +301,77 @@ def _parse_arguments(
     if not isinstance(value, dict):
         return None, "工具参数必须是 JSON 对象"
     return value, None
+
+
+def _new_tool_call() -> dict[str, Any]:
+    return {
+        "id": "",
+        "type": "function",
+        "function": {"name": "", "arguments": ""},
+    }
+
+
+def _tool_call_index(
+    partial: Mapping[str, Any],
+    position: int,
+    accumulator: Mapping[int, dict[str, Any]],
+) -> int:
+    index = partial.get("index")
+    if isinstance(index, int) and not isinstance(index, bool):
+        return index
+
+    call_id = partial.get("id")
+    if isinstance(call_id, str) and call_id:
+        for existing_index, existing in accumulator.items():
+            if existing.get("id") == call_id:
+                return existing_index
+    return position
+
+
+def _merge_tool_call_deltas(
+    accumulator: dict[int, dict[str, Any]],
+    deltas: Any,
+) -> None:
+    if not isinstance(deltas, list):
+        return
+
+    for position, partial in enumerate(deltas):
+        if not isinstance(partial, dict):
+            continue
+
+        index = _tool_call_index(partial, position, accumulator)
+        entry = accumulator.setdefault(index, _new_tool_call())
+
+        call_id = partial.get("id")
+        if isinstance(call_id, str) and call_id:
+            entry["id"] = call_id
+
+        call_type = partial.get("type")
+        if isinstance(call_type, str) and call_type:
+            entry["type"] = call_type
+
+        function = partial.get("function")
+        if not isinstance(function, dict):
+            continue
+
+        target = entry["function"]
+        name = function.get("name")
+        if isinstance(name, str) and name:
+            target["name"] = name
+
+        arguments = function.get("arguments")
+        if isinstance(arguments, str) and arguments:
+            target["arguments"] += arguments
+
+
+def _finalize_tool_call(
+    index: int,
+    call: dict[str, Any],
+) -> dict[str, Any]:
+    if not call.get("id"):
+        call["id"] = f"call_stream_{index}"
+
+    function = call["function"]
+    if not function["arguments"].strip():
+        function["arguments"] = "{}"
+    return call

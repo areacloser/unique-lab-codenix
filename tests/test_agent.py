@@ -48,6 +48,16 @@ class FakeClient:
         self.tool_options.append((tools, tool_choice))
         return {"choices": [{"message": self._messages.pop(0)}]}
 
+    def stream_chat_completion(
+        self,
+        messages: list[dict[str, Any]],
+        *,
+        tools: list[dict[str, Any]] | None = None,
+        tool_choice: str | dict[str, Any] | None = None,
+    ):
+        raise NotImplementedError("FakeClient 不支持流式")
+        yield {}
+
 
 class FakeRegistry:
     def __init__(self, results: Mapping[str, str] | None = None) -> None:
@@ -76,6 +86,47 @@ class FailingClient:
         tool_choice: str | dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         raise APIError("connection failed")
+
+    def stream_chat_completion(
+        self,
+        messages: list[dict[str, Any]],
+        *,
+        tools: list[dict[str, Any]] | None = None,
+        tool_choice: str | dict[str, Any] | None = None,
+    ):
+        raise APIError("connection failed")
+        yield {}
+
+
+class StreamingFakeClient:
+    def __init__(self, streams: list[list[dict[str, Any]]]) -> None:
+        self._streams = list(streams)
+        self.calls: list[dict[str, Any]] = []
+
+    def chat_completion(
+        self,
+        messages: list[dict[str, Any]],
+        *,
+        tools: list[dict[str, Any]] | None = None,
+        tool_choice: str | dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        raise AssertionError("流式测试不应调用 chat_completion")
+
+    def stream_chat_completion(
+        self,
+        messages: list[dict[str, Any]],
+        *,
+        tools: list[dict[str, Any]] | None = None,
+        tool_choice: str | dict[str, Any] | None = None,
+    ):
+        self.calls.append(
+            {
+                "messages": messages,
+                "tools": tools,
+                "tool_choice": tool_choice,
+            }
+        )
+        yield from self._streams.pop(0)
 
 
 def test_agent_keeps_context_across_turns() -> None:
@@ -237,3 +288,135 @@ def test_empty_input_is_rejected() -> None:
 
     with pytest.raises(ValueError, match="不能为空"):
         agent.send("   ")
+
+
+def test_agent_streams_content_tokens() -> None:
+    client = StreamingFakeClient(
+        [
+            [
+                {
+                    "choices": [
+                        {"delta": {"role": "assistant", "content": "你好"}}
+                    ]
+                },
+                {"choices": [{"delta": {"content": "，世界"}}]},
+                {
+                    "choices": [
+                        {"delta": {}, "finish_reason": "stop"}
+                    ]
+                },
+            ]
+        ]
+    )
+    agent = Agent(client, ConversationHistory("系统"))
+    tokens: list[str] = []
+
+    answer = agent.send("打个招呼", on_token=tokens.append)
+
+    assert answer == "你好，世界"
+    assert tokens == ["你好", "，世界"]
+    assert agent.history.messages()[-1] == {
+        "role": "assistant",
+        "content": "你好，世界",
+    }
+
+
+def test_agent_streams_and_merges_tool_call_deltas() -> None:
+    client = StreamingFakeClient(
+        [
+            [
+                {
+                    "choices": [
+                        {
+                            "delta": {
+                                "role": "assistant",
+                                "content": "我先读取",
+                            }
+                        }
+                    ]
+                },
+                {
+                    "choices": [
+                        {
+                            "delta": {
+                                "tool_calls": [
+                                    {
+                                        "index": 0,
+                                        "id": "call_1",
+                                        "type": "function",
+                                        "function": {
+                                            "name": "read_file",
+                                            "arguments": '{"path":',
+                                        },
+                                    }
+                                ]
+                            }
+                        }
+                    ]
+                },
+                {
+                    "choices": [
+                        {
+                            "delta": {
+                                "tool_calls": [
+                                    {
+                                        "index": 0,
+                                        "function": {
+                                            "arguments": ' "a.txt"}'
+                                        },
+                                    }
+                                ]
+                            }
+                        }
+                    ]
+                },
+                {
+                    "choices": [
+                        {"delta": {}, "finish_reason": "tool_calls"}
+                    ]
+                },
+            ],
+            [
+                {"choices": [{"delta": {"content": "读取完成"}}]},
+                {"choices": [{"delta": {}, "finish_reason": "stop"}]},
+            ],
+        ]
+    )
+    registry = FakeRegistry({"read_file": "hello"})
+    events: list[tuple[str, Any]] = []
+    agent = Agent(
+        client,
+        ConversationHistory("系统"),
+        tool_registry=registry,
+        on_tool_call=lambda name, args: events.append(("call", name)),
+        on_tool_result=lambda name, result: events.append(("result", result)),
+    )
+    tokens: list[str] = []
+
+    answer = agent.send("读取 a.txt", on_token=tokens.append)
+
+    assert answer == "读取完成"
+    assert tokens == ["我先读取", "读取完成"]
+    assert registry.calls == [("read_file", {"path": "a.txt"})]
+    assert events == [("call", "read_file"), ("result", "hello")]
+    assert client.calls[0]["tool_choice"] == "auto"
+    assert client.calls[0]["tools"] is not None
+
+    messages = agent.history.messages()
+    assert messages[2]["content"] == "我先读取"
+    assert messages[2]["tool_calls"] == [
+        {
+            "id": "call_1",
+            "type": "function",
+            "function": {
+                "name": "read_file",
+                "arguments": '{"path": "a.txt"}',
+            },
+        }
+    ]
+    assert messages[3] == {
+        "role": "tool",
+        "tool_call_id": "call_1",
+        "content": "hello",
+    }
+    assert messages[4]["content"] == "读取完成"
